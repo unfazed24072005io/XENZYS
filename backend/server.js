@@ -1,222 +1,291 @@
 const express = require('express');
 const cors = require('cors');
-const dotenv = require('dotenv');
 const path = require('path');
-const crypto = require('crypto');
-const { MongoClient, ObjectId } = require('mongodb');
 const fs = require('fs');
-const multer = require('multer');
-
-dotenv.config();
+const mongoose = require('mongoose');
+const cloudinary = require('cloudinary').v2;
+require('dotenv').config();
 
 const app = express();
+const PORT = process.env.PORT || 5000;
 
-// ============ CONFIGURATION ============
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
+const TEMP_DIR = path.join(__dirname, 'temp');
 
-// Create uploads directory
-if (!fs.existsSync(UPLOAD_DIR)) {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-  console.log(`📁 Created upload directory: ${UPLOAD_DIR}`);
-}
+// Create directories if they don't exist
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
+if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR);
 
-// ============ MIDDLEWARE ============
+// Cloudinary Configuration
+cloudinary.config({
+  cloud_name: 'doi8vbjji',
+  api_key: '454572477742312',
+  api_secret: 'CT1dolCMyCv7R0Tcms94biI-zH4'
+});
+
+console.log('✅ Cloudinary Configured');
+
+// MongoDB Connection
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log('✅ MongoDB Connected Successfully'))
+  .catch(err => {
+    console.error('❌ MongoDB Connection Error:', err);
+    process.exit(1);
+  });
+
+// Updated Video Schema (with more fields)
+const videoSchema = new mongoose.Schema({
+  fileName: {
+    type: String,
+    required: true
+  },
+  title: {
+    type: String,
+    default: function() {
+      return this.fileName.replace(/\.[^/.]+$/, "");
+    }
+  },
+  description: {
+    type: String,
+    default: ""
+  },
+  username: {
+    type: String,
+    default: "anonymous"
+  },
+  cloudinaryUrl: {
+    type: String,
+    required: true
+  },
+  publicId: {
+    type: String,
+    required: true
+  },
+  fileSize: {
+    type: Number,
+    required: true
+  },
+  uploadDate: {
+    type: Date,
+    default: Date.now
+  },
+  format: String,
+  duration: Number,
+  category: {
+    type: String,
+    default: "all"
+  },
+  tags: [String],
+  views: {
+    type: Number,
+    default: 0
+  }
+});
+
+const Video = mongoose.model('Video', videoSchema);
+
+// Middleware
 app.use(cors({
-  origin: isProduction 
-    ? ['https://your-frontend.netlify.app'] 
-    : '*',
+  origin: process.env.CLIENT_URL || 'http://localhost:3001',
   credentials: true
 }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// 1 HOUR TIMEOUTS
-app.use((req, res, next) => {
-  req.setTimeout(60 * 60 * 1000);
-  res.setTimeout(60 * 60 * 1000);
-  next();
-});
+// Serve uploaded files locally (as backup)
+app.use('/uploads', express.static(UPLOAD_DIR));
 
-// ============ MONGODB ============
-const mongoURI = process.env.MONGODB_URI;
-let db;
-
-async function connectDB() {
+// Get all videos from MongoDB
+app.get('/api/videos', async (req, res) => {
   try {
-    const client = new MongoClient(mongoURI);
-    await client.connect();
-    db = client.db('xenzys');
-    console.log('✅ MongoDB Connected');
+    const videos = await Video.find().sort({ uploadDate: -1 });
+    res.json({ success: true, videos });
   } catch (error) {
-    console.error('❌ MongoDB error:', error);
-    process.exit(1);
-  }
-}
-connectDB();
-
-// ============ SIMPLE DISK STORAGE ============
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, UPLOAD_DIR);
-  },
-  filename: (req, file, cb) => {
-    const uniqueName = Date.now() + '-' + crypto.randomBytes(8).toString('hex') + path.extname(file.originalname);
-    cb(null, uniqueName);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-const upload = multer({ 
-  storage: storage,
-  limits: { fileSize: 1000 * 1024 * 1024 * 1024 } // 1000GB
-});
-
-// ============ UPLOAD ENDPOINT ============
-app.post('/api/upload', upload.single('video'), async (req, res) => {
+// Get single video by ID
+app.get('/api/videos/:id', async (req, res) => {
   try {
-    const { title, type, username } = req.body;
+    const video = await Video.findById(req.params.id);
+    if (!video) {
+      return res.status(404).json({ success: false, error: 'Video not found' });
+    }
+    res.json({ success: true, video });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Upload chunk endpoint
+app.post('/api/upload-chunk', (req, res) => {
+  const { fileName, chunkIndex } = req.query;
+
+  if (!fileName || chunkIndex === undefined) {
+    return res.status(400).json({ error: 'Missing params' });
+  }
+
+  const chunkPath = path.join(TEMP_DIR, `${fileName}.${chunkIndex}`);
+  const writeStream = fs.createWriteStream(chunkPath);
+
+  req.pipe(writeStream);
+
+  writeStream.on('finish', () => {
+    res.json({ success: true });
+  });
+
+  writeStream.on('error', () => {
+    res.status(500).json({ error: 'Chunk write failed' });
+  });
+});
+
+// Merge chunks and upload to Cloudinary
+app.post('/api/merge-chunks', async (req, res) => {
+  const { fileName, totalChunks, videoDetails } = req.body;
+
+  if (!fileName || !totalChunks) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+
+  try {
+    console.log(`🔄 Merging ${totalChunks} chunks for ${fileName}`);
     
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
+    const finalPath = path.join(UPLOAD_DIR, fileName);
+    const writeStream = fs.createWriteStream(finalPath);
+
+    // Calculate total file size
+    let totalSize = 0;
+
+    // Merge all chunks
+    for (let i = 0; i < totalChunks; i++) {
+      const chunkPath = path.join(TEMP_DIR, `${fileName}.${i}`);
+
+      if (!fs.existsSync(chunkPath)) {
+        writeStream.end();
+        return res.status(400).json({ error: `Missing chunk ${i}` });
+      }
+
+      const stats = fs.statSync(chunkPath);
+      totalSize += stats.size;
+
+      const chunk = fs.readFileSync(chunkPath);
+      writeStream.write(chunk);
+      
+      fs.unlinkSync(chunkPath);
     }
 
-    console.log('\n=================================');
-    console.log(`📤 FILE RECEIVED:`);
-    console.log(`   Name: ${req.file.originalname}`);
-    console.log(`   Saved as: ${req.file.filename}`);
-    console.log(`   Size: ${(req.file.size / 1024 / 1024).toFixed(2)} MB`);
-    console.log(`   Path: ${req.file.path}`);
-    console.log('=================================\n');
+    // Finish writing the merged file
+    writeStream.end();
 
-    // Save to database
-    const video = {
-      title: title || 'Untitled',
-      filename: req.file.filename,
-      type: type || 'long',
-      size: req.file.size,
-      username: username || 'Anonymous',
-      views: 0,
-      likes: 0,
-      dislikes: 0,
-      comments: [],
-      createdAt: new Date(),
-      path: req.file.path
-    };
+    writeStream.on('finish', async () => {
+      try {
+        console.log(`📤 Uploading ${fileName} to Cloudinary...`);
+        
+        // Upload to Cloudinary
+        const result = await cloudinary.uploader.upload(finalPath, {
+          resource_type: 'video',
+          folder: 'video_uploads',
+          public_id: fileName.split('.')[0],
+          eager: [
+            { width: 300, height: 300, crop: "pad" }
+          ]
+        });
 
-    const result = await db.collection('videos').insertOne(video);
-    
-    res.json({
-      success: true,
-      video: {
-        _id: result.insertedId,
-        ...video
+        console.log('✅ Uploaded to Cloudinary:', result.secure_url);
+
+        // Prepare video details from frontend or use defaults
+        const details = videoDetails || {};
+        
+        // Save metadata to MongoDB with all fields
+        const video = new Video({
+          fileName: fileName,
+          title: details.title || fileName.replace(/\.[^/.]+$/, ""),
+          description: details.description || "",
+          username: details.username || "anonymous",
+          cloudinaryUrl: result.secure_url,
+          publicId: result.public_id,
+          fileSize: result.bytes || totalSize,
+          format: result.format,
+          duration: result.duration,
+          category: details.category || "all",
+          tags: details.tags || []
+        });
+
+        await video.save();
+        console.log('✅ Video metadata saved to MongoDB');
+        console.log('📋 Video details:', {
+          title: video.title,
+          description: video.description,
+          username: video.username,
+          category: video.category
+        });
+
+        res.json({ 
+          success: true,
+          message: 'Upload complete',
+          video: {
+            _id: video._id,
+            fileName: video.fileName,
+            title: video.title,
+            description: video.description,
+            username: video.username,
+            url: video.cloudinaryUrl,
+            fileSize: video.fileSize,
+            uploadDate: video.uploadDate,
+            category: video.category,
+            tags: video.tags
+          }
+        });
+
+      } catch (cloudinaryError) {
+        console.error('❌ Cloudinary upload error:', cloudinaryError);
+        res.status(500).json({ 
+          success: false, 
+          error: 'Failed to upload to Cloudinary',
+          details: cloudinaryError.message 
+        });
       }
     });
 
-  } catch (error) {
-    console.error('❌ Upload error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ============ STREAM VIDEO FROM DISK ============
-app.get('/api/video/:filename', async (req, res) => {
-  try {
-    const video = await db.collection('videos').findOne({ 
-      filename: req.params.filename 
+    writeStream.on('error', (error) => {
+      console.error('❌ Write stream error:', error);
+      res.status(500).json({ error: 'Failed to merge chunks' });
     });
-    
-    if (!video) {
-      return res.status(404).json({ error: 'Video not found' });
-    }
 
-    const filePath = path.join(UPLOAD_DIR, video.filename);
-    
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: 'File not found on disk' });
-    }
-
-    // Update view count
-    await db.collection('videos').updateOne(
-      { _id: video._id },
-      { $inc: { views: 1 } }
-    );
-
-    const stat = fs.statSync(filePath);
-    const fileSize = stat.size;
-    const range = req.headers.range;
-
-    if (range) {
-      const parts = range.replace(/bytes=/, '').split('-');
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-      const chunksize = (end - start) + 1;
-      
-      res.writeHead(206, {
-        'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-        'Accept-Ranges': 'bytes',
-        'Content-Length': chunksize,
-        'Content-Type': 'video/mp4',
-      });
-      
-      fs.createReadStream(filePath, { start, end }).pipe(res);
-    } else {
-      res.writeHead(200, {
-        'Content-Length': fileSize,
-        'Content-Type': 'video/mp4',
-      });
-      fs.createReadStream(filePath).pipe(res);
-    }
   } catch (error) {
-    console.error('Stream error:', error);
+    console.error('❌ Merge error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// ============ GET VIDEOS ============
-app.get('/api/videos/:type', async (req, res) => {
+// Update video views
+app.post('/api/videos/:id/view', async (req, res) => {
   try {
-    const type = req.params.type;
-    const videos = await db.collection('videos')
-      .find({ type })
-      .sort({ createdAt: -1 })
-      .limit(50)
-      .toArray();
-    
-    res.json({ videos });
+    const video = await Video.findByIdAndUpdate(
+      req.params.id,
+      { $inc: { views: 1 } },
+      { new: true }
+    );
+    res.json({ success: true, views: video.views });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// ============ INTERACTIONS ============
-app.post('/api/video/:id/like', async (req, res) => {
-  await db.collection('videos').updateOne(
-    { _id: new ObjectId(req.params.id) },
-    { $inc: { likes: 1 } }
-  );
-  res.json({ success: true });
+// Test route
+app.get('/api/test', (req, res) => {
+  res.json({ 
+    success: true, 
+    message: 'Server is running',
+    cloudinary: 'Configured',
+    mongodb: mongoose.connection.readyState === 1 ? 'Connected' : 'Disconnected'
+  });
 });
 
-app.post('/api/video/:id/dislike', async (req, res) => {
-  await db.collection('videos').updateOne(
-    { _id: new ObjectId(req.params.id) },
-    { $inc: { dislikes: 1 } }
-  );
-  res.json({ success: true });
-});
-
-app.post('/api/video/:id/comment', async (req, res) => {
-  const { username, text } = req.body;
-  await db.collection('videos').updateOne(
-    { _id: new ObjectId(req.params.id) },
-    { $push: { comments: { username, text, createdAt: new Date() } } }
-  );
-  res.json({ success: true });
-});
-
-const PORT = process.env.PORT || 5000;
-const isProduction = process.env.NODE_ENV === 'production';
 app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
-  console.log(`📁 Videos saved to: ${UPLOAD_DIR}`);
-  console.log(`⚠️  Make sure this drive has enough space!`);
+  console.log('🚀 Server running on port', PORT);
+  console.log('📁 Upload directory:', UPLOAD_DIR);
+  console.log('📁 Temp directory:', TEMP_DIR);
+  console.log('☁️  Cloudinary configured with cloud:', 'doi8vbjji');
 });

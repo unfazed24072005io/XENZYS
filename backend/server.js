@@ -86,7 +86,15 @@ const Video = mongoose.model('Video', videoSchema);
 
 // Middleware
 app.use(cors({
-  origin: ['http://localhost:3000', 'http://localhost:3001', 'https://xenzys.onrender.com'],
+  origin: [
+    'http://localhost:3000',           // React dev server
+    'http://localhost:3001',           // React dev server (alternate)
+    'https://xenzys.onrender.com',     // Your deployed backend
+    'capacitor://localhost',            // ⬅️ Capacitor iOS
+    'http://localhost',                  // ⬅️ Capacitor Android (HTTP)
+    'http://192.168.%',                   // ⬅️ Your local network IPs
+    'file://'                             // ⬅️ Some Capacitor setups
+  ],
   credentials: true
 }));
 app.use(express.json());

@@ -1,0 +1,11 @@
+# Backend uploads and temp
+backend/uploads/
+backend/temp/
+backend/uploads/*.mp4
+backend/temp/*.mp4
+backend/uploads/**/*
+backend/temp/**/*
+*.mp4
+*.mov
+*.avi
+*.mkv

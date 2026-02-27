@@ -86,7 +86,7 @@ const Video = mongoose.model('Video', videoSchema);
 
 // Middleware
 app.use(cors({
-  origin: process.env.CLIENT_URL || 'http://localhost:3001',
+  origin: ['http://localhost:3000', 'http://localhost:3001', 'https://xenzys.onrender.com'],
   credentials: true
 }));
 app.use(express.json());
